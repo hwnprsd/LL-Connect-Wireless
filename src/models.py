@@ -123,6 +123,7 @@ class Settings(BaseModel):
     cpu_curve: CurveMode = Field(default_factory=default_cpu_curve)
     gpu_curve: CurveMode = Field(default_factory=default_gpu_curve)
     gpu_temp_macs: List[str] = Field(default_factory=list)
+    cpu_temp_command: Optional[str] = None  # if set, runs this shell command and uses stdout as CPU temp °C
 
     @field_validator("gpu_temp_macs")
     @classmethod

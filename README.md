@@ -1,247 +1,102 @@
-# LL-Connect-Wireless
+# LL-Connect-Wireless (no-whiz fork)
 
-LL-Connect-Wireless is a **Linux daemon and CLI tool** for controlling **Lian Li Wireless Fans** using direct USB communication with the **Lian Li Wireless Controllers**.<br />
-It provides real-time fan speed control, temperature-based PWM curves, and a lightweight CLI for monitoring system state.
+A Linux daemon for controlling **Lian Li wireless fans** (V1 USB dongles, VID `0x0416`, PIDs `0x8040` TX / `0x8041` RX). This is a fork of [Yoinky3000/LL-Connect-Wireless](https://github.com/Yoinky3000/LL-Connect-Wireless) that fixes the audible periodic "whizzing" the upstream daemon (and every other Linux Lian-Li daemon I tried) exhibits in steady state.
 
-This project is designed to run as a **system service** and operate independently of proprietary Windows software.
+## What's the problem this fixes?
 
----
+If you've used the Lian-Li wireless dongle on Linux you've probably noticed: even when commanded PWM never changes, your fans periodically spike up and back down — a soft, repetitive "whizzz, whizzz" sound every 1-10 seconds. It's there with `sgtaziz/lian-li-linux` and the upstream of this fork too.
 
-## Background
+Two root causes:
 
-Recently I have ditched windows and start using fedora as my PC OS, as i have had enough of windows poor performance and optimization.
+1. **Missing RF keepalive.** Both Linux daemons send PWM commands to fans only when the value *changes*. Once you're at a constant target, no further packets go out. The fan firmware has a short keepalive (~100ms) — when it stops hearing from the dongle, it falls back to a hardware safe-mode (full speed) until the next packet arrives. That's the whiz: brief lapse to safe-mode, then back to commanded.
+2. **RF queue overflow + audible "ack" on each packet.** Solving #1 by hammering the dongle continuously causes a different problem — every transmit packet triggers a brief audible response from the fan firmware (looks like a momentary RPM ramp). And firing transactions to multiple fans back-to-back overflows the dongle's queue, so most of the new commands are silently dropped.
 
-But one thing that frustrated me is that
-my pc is built with Lian Li SL120 V3, which is controlled wirelessly with the usb controller, and there is currently no app that support it, so i try to make one by reverse-engineering the signal sent from L-Connect 3 app with wireshark
+Windows L-Connect 3 doesn't have either issue because it implements the proper RF keepalive protocol that Lian-Li never documented. We can't see that code, so this fork works around it instead.
 
-> Credit to [OpenUniLink](https://github.com/ealcantara22/OpenUniLink) for the methods to communicate with the wireless controller
+## What this fork does
 
----
+The architecture is split into three threads with carefully tuned cadences:
 
-## ⚠️ Disclaimer
+- **`discovery_thread`** (every 2s) — re-scans the dongle for the bound fan list. Long sleeps OK; doesn't block anything.
+- **`temp_thread`** (every 500ms) — reads CPU temp (psutil or a custom shell command, see below) and computes the curve target.
+- **`transmit_thread`** (every 20ms outer) — sends the current PWM to all fans, **dual-mode**:
+  - **Steady state**: rapid back-to-back transmits to all 4 fan groups, no per-fan gap. The dongle coalesces the constant identical packets and the fans don't see "new" RF events to whir at. Result: silent at constant PWM.
+  - **On change** (any commanded PWM differs from last sent by more than a hysteresis threshold): switches to a multi-cycle "delivery burst" — 4 cycles, each with a 150ms per-fan gap. This lets the dongle process each fan's transaction cleanly and gets the new value to all 4 fans in ~2.4s. Then automatically back to silent rapid mode.
 
-**This project is NOT affiliated with, endorsed by, or supported by Lian Li or any of its products.**
+Plus a few smaller pieces:
 
-* Lian Li® and related product names are trademarks of their respective owners.
-* This project is a **reverse-engineered implementation** intended for Linux users.
-* Use at your own risk.
+- **Hysteresis (5 PWM bytes ≈ 2%)** in the transmit thread — micro PWM changes from temp jitter are absorbed and don't trigger a delivery burst. Real curve transitions (e.g. CPU jumping from 50 → 70 °C) still ramp the fans normally.
+- **Master device filtered from transmits** — the dongle reports an unbound master device with `rx_type=255`. Sending PWM frames to that confuses the dongle. Filtered out, but still kept in `/status` for visibility.
+- **`cpu_temp_command` config field** — set this to a shell command (or path to a script), and the daemon will execute it every 500ms and parse stdout as the CPU temperature in °C. Useful for testing curves with fake temperatures, blending sensors, or feeding any custom temperature signal you want.
 
----
+## Trade-offs
 
-## Features
+- **CPU/USB usage** is higher than upstream — the transmit thread runs continuously at ~50 Hz instead of going idle when nothing changes. On any modern desktop the load is unmeasurable, but it is non-zero.
+- **A real temperature change still produces a brief audible ramp** — that's unavoidable, the fans physically need to change speed. What's eliminated is the *idle-state* periodic whiz that has nothing to do with real temperature movement.
+- **Pump and AIO LCD aren't handled** — same as upstream. This daemon only does fans. If you have a HydroShift II AIO and want pump/LCD control, you'll need a separate solution.
 
-* Direct USB control via `libusb`
-* Wireless fan detection and monitoring
-* Temperature-based PWM control (CPU + GPU if specified)
-* 4-point curve mode with linear interpolation between points
-* Immediate fan response to temperature changes
-* Runs as a systemd service
-* CLI for managing the app and real-time status display
-
----
-
-## Components
-
-| Component              | Description                        |
-| ---------------------- | ---------------------------------- |
-| `ll-connect-wirelessd` | Background daemon (system service) |
-| `ll-connect-wireless`  | CLI tool for viewing live data     |
-| systemd service        | Auto-start on boot                 |
-| udev rules             | USB permission handling            |
-
----
-
-## Installation
-
-### Fedora 42/43
-
-Go to the [Release](https://github.com/Yoinky3000/LL-Connect-Wireless/releases/latest) page<br />
-Download the rpm package, and install it with dnf:
+## Install (Arch / EndeavourOS)
 
 ```bash
-sudo dnf install *.fcXX.x86_64.rpm
-```
-
-### Ubuntu 22/24, Debian 12
-
-Go to the [Release](https://github.com/Yoinky3000/LL-Connect-Wireless/releases/latest) page<br />
-Download the deb package, and install it with apt:
-
-```bash
-sudo apt install *.deb
-```
-
-### After installation:
-
-* run `start` command to start the service
-* you can also use `enable` command to enable the service so that it will keep running if your computer restarted
-
-### Build and package for Debian/Ubuntu
-
-Install build dependencies:
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip dpkg-dev build-essential
-```
-
-Build:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-./deb/compile.sh
-```
-
-Install:
-
-```bash
-sudo apt install ./deb/.result/ll-connect-wireless-*.deb
-```
-
-Enable and run user service:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now ll-connect-wireless.service
-```
-
-### Build and package for Arch Linux
-
-Install build dependencies:
-
-```bash
-sudo pacman -S --needed base-devel python python-pip
-```
-
-Build:
-
-```bash
+sudo pacman -S --needed base-devel git
+git clone https://github.com/hwnprsd/LL-Connect-Wireless ~/src/LL-Connect-Wireless
+cd ~/src/LL-Connect-Wireless
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ./arch/compile.sh
-```
-
-Install:
-
-```bash
 sudo pacman -U ./arch/.result/ll-connect-wireless-*.pkg.tar.zst
-```
-
-Enable and run user service:
-
-```bash
 systemctl --user daemon-reload
 systemctl --user enable --now ll-connect-wireless.service
+loginctl enable-linger $USER     # so the daemon starts at boot, not at login
 ```
 
-### Other distro
-
-If you would like to help package this for additional distributions, feel free to open a Pull Request!
-
----
-
-## CLI Usage
-
-Full CLI reference can be found here:
-
-[CLI.md](CLI.md)
-
----
+For Debian/Ubuntu/Fedora install paths, see the [original upstream README](UPSTREAM_README.md).
 
 ## Configuration
 
-Config file path:
+Settings are stored at `~/.config/ll-connect-wireless/config.json` and the CLI is the same as upstream. Quick reference:
 
-`~/.config/ll-connect-wireless/config.json`
+```bash
+# 4-point temperature curve
+ll-connect-wireless settings set-mode curve
+ll-connect-wireless settings curve set-cpu-curve "30:55,60:65,75:80,85:100"
 
-Curve mode defaults:
+# Or a fixed PWM
+ll-connect-wireless settings set-mode linear
+ll-connect-wireless settings linear set-curve 30           # constant 30%
+ll-connect-wireless settings linear set-curve 35:25,80:80  # linear ramp
 
-* `CPU_FAN_CURVE=50:27,60:37,90:70,95:100`
-* `GPU_FAN_CURVE=35:30,60:40,70:60,75:90`
-
-Linear mode defaults:
-
-* `CPU_LINEAR=35:10,80:70`
-* `GPU_LINEAR=35:25,75:90`
-
-`GPU_TEMP_MACS` is a list of fan-group MAC addresses that should use GPU temperature instead of CPU temperature.
-If a MAC is not listed, it uses the CPU curve by default.
-
-Example:
-
-```json
-{
-    "mode": "curve",
-    "CPU_FAN_CURVE": "50:27,60:37,90:70,95:100",
-    "GPU_FAN_CURVE": "35:30,60:40,70:60,75:90",
-    "GPU_TEMP_MACS": [
-        "58:cc:1e:a7:14:54"
-    ]
-}
+# Live monitor
+ll-connect-wireless
 ```
 
-Curve format:
+### Custom temperature source
 
-* Format: `temp_c:percent,temp_c:percent,temp_c:percent,temp_c:percent`
-* Each step is a temperature (Celsius) and fan speed (0-100%).
-* Values between steps are linearly interpolated.
-* Temperatures at or below the first step use that step's speed.
-* Temperatures at or above the last step use that step's speed.
+Drop in a script (or any shell command) that prints a number in °C:
 
----
+```bash
+cat > ~/.config/ll-connect-wireless/cpu_temp_test.sh <<'EOF'
+#!/bin/bash
+echo 50
+EOF
+chmod +x ~/.config/ll-connect-wireless/cpu_temp_test.sh
 
-## Stat Monitoring
+jq '. + {cpu_temp_command: "/home/<you>/.config/ll-connect-wireless/cpu_temp_test.sh"}' \
+  ~/.config/ll-connect-wireless/config.json > /tmp/cfg.new && \
+  mv /tmp/cfg.new ~/.config/ll-connect-wireless/config.json
 
-You will see something like this when you run the monitor command:
-
-```
-CPU Temp: 52.0 °C
-GPU Temp: 48.0 °C
-
-Fan Address       | Fans | Cur % | Tgt % | RPM
---------------------------------------------------------
-58:cc:1e:a7:14:54 |    3 |   32% |   35% | 712, 708, 710
-2e:c1:1e:a7:14:54 |    4 |   32% |   35% | 703, 701, 699, 705
+systemctl --user restart ll-connect-wireless.service
 ```
 
----
+The daemon picks up the new value within ~500ms. To revert to real Tctl, `jq 'del(.cpu_temp_command)'` and restart.
 
-## Permissions & Security
+## Credits
 
-* The daemon runs as **non-root**
-* USB permissions are managed via udev rules
-* CLI access does **not** require root, except for update/uninstall
+- **Upstream**: [Yoinky3000/LL-Connect-Wireless](https://github.com/Yoinky3000/LL-Connect-Wireless) — the Python daemon + CLI this is based on.
+- **Protocol research**: [ealcantara22/OpenUniLink](https://github.com/ealcantara22/OpenUniLink) — original reverse-engineering of the Lian-Li wireless dongle protocol.
+- **Hardware reference**: Lian Li® L-Connect 3 Windows software (the reference for "what the protocol should look like when it's working right"). Lian Li and L-Connect are trademarks of Lian-Li Industrial Co., Ltd.
 
----
+## Disclaimer
 
-## How It Works
-
-1. Daemon communicates directly with the wireless controller over USB
-2. Device state is polled periodically
-3. CPU temperature is read from the system
-4. GPU temperature is read via `nvidia-smi` (if available)
-5. Target PWM is calculated from configured curves
-6. Fan groups in `GPU_TEMP_MACS` use the GPU curve; all others use CPU curve
-7. Fan speeds are updated immediately based on current temperature mapping
-8. State is exposed to the CLI via a Unix socket
-
----
-
-## Roadmap
-
-Planned features:
-
-* Per-channel custom curves
-* GUI frontend
-
----
-
-## License
-
-MIT License<br/>
-See `LICENSE` for details.
-
----
+Not affiliated with, endorsed by, or supported by Lian-Li. This is a reverse-engineered implementation, use at your own risk. If your fans catch fire or your AIO leaks, that's between you and physics.

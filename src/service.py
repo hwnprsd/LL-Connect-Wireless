@@ -38,8 +38,15 @@ async def get_status():
 
 @app.post("/reload-settings")
 async def reload_settings():
-    global SETTINGS
+    global SETTINGS, _known_fans
     SETTINGS = load_settings()
+    print(f"[reload] SETTINGS reloaded: mode={SETTINGS.mode} linear={SETTINGS.linear}", flush=True)
+    # Force re-discovery so the dongle's RF state is refreshed for all fans.
+    # Without this, only the AIO seems to pick up new PWM; case fans need a
+    # full daemon restart. Theory: dongle caches per-fan addressing and
+    # re-discovery re-arms it.
+    with _state_lock:
+        _known_fans = []
     return {"msg": "ok"}
 
 
@@ -77,7 +84,20 @@ MAX_DEVICES_PAGE = 10
 # MAX_TEMP = 85.0
 SETTINGS = load_settings()
 
-LOOP_INTERVAL = 0.5
+LOOP_INTERVAL = 0.01
+TX_INTERVAL = 0.02       # transmit thread cadence (s) — fast outer loop, fan-burst inner
+DISCOVERY_INTERVAL = 2.0 # how often to re-discover the fan list (s)
+TEMP_INTERVAL = 0.5      # how often to re-read temp + recompute curve (s)
+
+# ==============================
+# SHARED STATE (for the 3-thread design)
+# ==============================
+_state_lock = threading.Lock()
+_known_fans: List["Fan"] = []
+_target_pwm_cpu: Optional[int] = None
+_target_pwm_gpu: Optional[int] = None
+_last_cpu_temp: Optional[float] = None
+_last_gpu_temp: Optional[float] = None
 
 
 # ==============================
@@ -197,6 +217,25 @@ def list_fans(rx: usb.core.Device, last_fans_data: List[Fan] = []):
 # CPU/GPU TEMP
 # ==============================
 def get_cpu_temp():
+    cmd = getattr(SETTINGS, "cpu_temp_command", None)
+    if cmd:
+        try:
+            output = subprocess.check_output(
+                ["/bin/sh", "-c", cmd],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=1.0,
+            ).strip()
+            val = float(output.splitlines()[0])
+            return val
+        except Exception as e:
+            print(f"[cpu_temp_command] failed: {e}", flush=True)
+            return None
+    # No custom command set — log this once-ish so we can confirm
+    if not getattr(get_cpu_temp, "_logged_no_cmd", False):
+        print(f"[cpu_temp] no cpu_temp_command in SETTINGS, using psutil. SETTINGS keys: {list(SETTINGS.model_dump().keys())}", flush=True)
+        get_cpu_temp._logged_no_cmd = True
+
     temps = psutil.sensors_temperatures()
     tctl = None
     values = []
@@ -308,128 +347,206 @@ def build_data(fan: Fan, seq):
     return frame
 
 
-# ==============================
-# MAIN LOOP
-# ==============================
-def fan_control_loop(rx: usb.core.Device, tx: usb.core.Device):
-    global SETTINGS
-    last_fans_amount = 0
-    warned_missing_gpu_temp = False
-    last_fans_data: List[Fan] = []
+def build_multi_data(fans, seq):
+    """Multi-fan packet: each seq slot encodes one fan's data so a single
+    transaction targets all fans simultaneously."""
+    frame = bytearray()
+    frame += u8(0x10)
+    frame += u8(seq)
+    if seq < len(fans):
+        fan = fans[seq]
+        frame += u8(fan.channel)
+        frame += u8(fan.rx_type)
+        frame += u8(0x12)
+        frame += u8(0x10)
+        frame += mac_to_bytes(fan.mac)
+        frame += mac_to_bytes(fan.master_mac)
+        frame += u8(fan.rx_type)
+        frame += u8(fan.channel)
+        frame += u8(fan.rx_type)
+        frame += bytes([fan.pwm] * 4)
+    else:
+        frame += bytes(4)
+        frame += bytes(6)
+        frame += bytes(6)
+        frame += bytes(3)
+        frame += bytes(4)
+    return frame
 
-    err = 0
+
+# ==============================
+# 3-THREAD DESIGN
+# ==============================
+# Original monolithic loop called list_fans() (USB read, up to 500ms timeout)
+# every iteration, blocking transmits. Now split into independent threads:
+#   - discovery_thread: re-discovers fan list every DISCOVERY_INTERVAL
+#   - temp_thread:      reads CPU/GPU temp + computes target PWM every TEMP_INTERVAL
+#   - transmit_thread:  sends PWM to known fans every TX_INTERVAL (never blocks on reads)
+
+
+def _compute_targets(cpu_temp: Optional[float], gpu_temp: Optional[float],
+                     should_read_gpu_temp: bool):
+    cpu_target_pwm = None
+    gpu_target_pwm = None
+    if SETTINGS.mode == FanMode.linear:
+        if cpu_temp is not None:
+            cpu_target_pwm = temp_to_pwm(cpu_temp, SETTINGS.linear)
+        if should_read_gpu_temp and gpu_temp is not None:
+            gpu_target_pwm = temp_to_pwm(gpu_temp, SETTINGS.gpu_linear)
+        elif should_read_gpu_temp and cpu_temp is not None:
+            gpu_target_pwm = temp_to_pwm(cpu_temp, SETTINGS.gpu_linear)
+    else:
+        if cpu_temp is not None:
+            cpu_target_pwm = curve_to_pwm(cpu_temp, SETTINGS.cpu_curve)
+        if should_read_gpu_temp and gpu_temp is not None:
+            gpu_target_pwm = curve_to_pwm(gpu_temp, SETTINGS.gpu_curve)
+        elif should_read_gpu_temp and cpu_temp is not None:
+            gpu_target_pwm = curve_to_pwm(cpu_temp, SETTINGS.cpu_curve)
+    return cpu_target_pwm, gpu_target_pwm
+
+
+def discovery_thread(rx: usb.core.Device):
+    global _known_fans
+    iteration = 0
+    while True:
+        try:
+            with _state_lock:
+                snap = list(_known_fans)
+            new_fans = list_fans(rx, snap)
+            iteration += 1
+            if iteration % 5 == 0:
+                print(f"[discovery] iter={iteration} got {len(new_fans)} fan(s)", flush=True)
+            if new_fans:
+                with _state_lock:
+                    prev_targets = {f.mac: f.target_pwm for f in _known_fans}
+                    for f in new_fans:
+                        if f.mac in prev_targets and prev_targets[f.mac]:
+                            f.target_pwm = prev_targets[f.mac]
+                            f.pwm = prev_targets[f.mac]
+                    _known_fans = new_fans
+        except Exception as e:
+            print(f"[discovery] ERROR iter={iteration}: {type(e).__name__}: {e}", flush=True)
+        time.sleep(DISCOVERY_INTERVAL)
+
+
+def temp_thread():
+    global _target_pwm_cpu, _target_pwm_gpu, _last_cpu_temp, _last_gpu_temp
+    last_cpu_pwm = None
     while True:
         try:
             cpu_temp = get_cpu_temp()
             gpu_mac_set = set(SETTINGS.gpu_temp_macs)
             should_read_gpu_temp = len(gpu_mac_set) > 0
             gpu_temp = get_gpu_temp() if should_read_gpu_temp else None
-
-            cpu_target_pwm: Optional[int] = None
-            gpu_target_pwm: Optional[int] = None
-
-            if SETTINGS.mode == FanMode.linear:
-                if cpu_temp is not None:
-                    cpu_target_pwm = temp_to_pwm(cpu_temp, SETTINGS.linear)
-
-                if should_read_gpu_temp and gpu_temp is not None:
-                    gpu_target_pwm = temp_to_pwm(gpu_temp, SETTINGS.gpu_linear)
-                    warned_missing_gpu_temp = False
-                elif should_read_gpu_temp and cpu_temp is not None:
-                    gpu_target_pwm = temp_to_pwm(cpu_temp, SETTINGS.gpu_linear)
-                    if DEV_MODE and not warned_missing_gpu_temp:
-                        print(
-                            "GPU temp unavailable; GPU-routed fan groups are temporarily using CPU temperature with GPU linear mapping."
-                        )
-                        warned_missing_gpu_temp = True
-                else:
-                    warned_missing_gpu_temp = False
-            else:
-                if cpu_temp is not None:
-                    cpu_target_pwm = curve_to_pwm(cpu_temp, SETTINGS.cpu_curve)
-
-                if should_read_gpu_temp and gpu_temp is not None:
-                    gpu_target_pwm = curve_to_pwm(gpu_temp, SETTINGS.gpu_curve)
-                    warned_missing_gpu_temp = False
-                elif should_read_gpu_temp and cpu_temp is not None:
-                    gpu_target_pwm = curve_to_pwm(cpu_temp, SETTINGS.cpu_curve)
-                    if DEV_MODE and not warned_missing_gpu_temp:
-                        print(
-                            "GPU temp unavailable; GPU-routed fan groups are temporarily using the CPU curve."
-                        )
-                        warned_missing_gpu_temp = True
-                else:
-                    warned_missing_gpu_temp = False
-
-            if cpu_target_pwm is None and gpu_target_pwm is None:
-                time.sleep(1)
-                continue
-
-            fans = list_fans(rx, last_fans_data)
-
-            if last_fans_amount != 0 and len(fans) == 0:
-                continue
-            last_fans_amount = len(fans)
-
-            updated_fans: List[str] = []
-
-            for f in fans:
-                mac = f.mac.lower()
-                wants_gpu_temp = mac in gpu_mac_set
-                if wants_gpu_temp and gpu_target_pwm is not None:
-                    target_pwm = gpu_target_pwm
-                elif cpu_target_pwm is not None:
-                    target_pwm = cpu_target_pwm
-                else:
-                    target_pwm = f.pwm
-                if target_pwm != f.target_pwm: updated_fans.append(f.mac)
-
-                f.target_pwm = target_pwm
-                f.pwm = f.target_pwm
-            for f in fans:
-                if not f.mac in updated_fans: continue
-                for i in range(len(fans)):
-                    tx.write(USB_OUT, build_data(f, i))
-                time.sleep(0.1)
-
-            update_state(cpu_temp, gpu_temp, fans)
-
-            if DEV_MODE:
-                clear_console()
-                displayDetected(fans)
-                cpu_text = f"{cpu_temp:.1f} °C" if cpu_temp is not None else "N/A"
-                gpu_text = f"{gpu_temp:.1f} °C" if gpu_temp is not None else "N/A"
-                print(f"\n\nCPU Temp: {cpu_text}")
-                print(f"GPU Temp: {gpu_text}\n")
-                print(f"{'Fan Address':17} | Fans | Cur % | Tgt % | RPM")
-                print("-" * 72)
-
-                for d in fans:
-                    mac = d.mac
-
-                    tgt_pwm = d.target_pwm
-
-                    cur_pct = int(d.pwm / 255 * 100)
-                    tgt_pct = int(tgt_pwm / 255 * 100)
-
-                    rpm = ", ".join(str(r) for r in d.rpm if r > 0)
-
-                    print(
-                        f"{mac:17} | "
-                        f"{d.fan_count:>4} | "
-                        f"{cur_pct:>5}% | "
-                        f"{tgt_pct:>5}% | "
-                        f"{rpm}"
-                    )
-            err = 0
-            last_fans_data = fans
+            cpu_pwm, gpu_pwm = _compute_targets(cpu_temp, gpu_temp, should_read_gpu_temp)
+            if cpu_pwm != last_cpu_pwm:
+                print(f"[temp] cpu_pwm changed {last_cpu_pwm} -> {cpu_pwm} (temp={cpu_temp}, mode={SETTINGS.mode})", flush=True)
+                last_cpu_pwm = cpu_pwm
+            with _state_lock:
+                _target_pwm_cpu = cpu_pwm
+                _target_pwm_gpu = gpu_pwm
+                _last_cpu_temp = cpu_temp
+                _last_gpu_temp = gpu_temp
         except Exception as e:
-            if err > 3:
-                raise e
-            else:
-                err += 1
-        finally:
-            time.sleep(LOOP_INTERVAL)
+            print(f"[temp] error: {type(e).__name__}: {e}", flush=True)
+        time.sleep(TEMP_INTERVAL)
+
+
+def transmit_thread(tx: usb.core.Device):
+    # Rapid back-to-back transmits to all fans every cycle, no per-fan gap.
+    # When a real value change is detected, switch to a multi-cycle "delivery
+    # burst" with per-fan gap so all 4 fans actually receive the new value
+    # (single-burst isn't enough to overcome dongle queue saturation).
+    HYSTERESIS = 5
+    BURST_CYCLES_ON_CHANGE = 4   # # of 150ms-gap cycles after a change
+    last_sent_cpu = None
+    last_sent_gpu = None
+    remaining_burst = 0
+    while True:
+        try:
+            with _state_lock:
+                fans_snap = list(_known_fans)
+                cpu_pwm = _target_pwm_cpu
+                gpu_pwm = _target_pwm_gpu
+                cpu_temp = _last_cpu_temp
+                gpu_temp = _last_gpu_temp
+                gpu_mac_set = set(SETTINGS.gpu_temp_macs)
+
+            # Apply hysteresis: small deltas snap back to the last-sent value
+            if cpu_pwm is not None and last_sent_cpu is not None:
+                if abs(cpu_pwm - last_sent_cpu) <= HYSTERESIS:
+                    cpu_pwm = last_sent_cpu
+            if gpu_pwm is not None and last_sent_gpu is not None:
+                if abs(gpu_pwm - last_sent_gpu) <= HYSTERESIS:
+                    gpu_pwm = last_sent_gpu
+
+            real_fans = [f for f in fans_snap if f.is_bound]
+
+            if (cpu_pwm is None and gpu_pwm is None) or not real_fans:
+                time.sleep(TX_INTERVAL)
+                continue
+
+            # Detect a real value change (after hysteresis). On change, queue
+            # up BURST_CYCLES_ON_CHANGE delivery cycles with per-fan 150ms gap
+            # so all fans actually receive the new value (one cycle isn't
+            # enough — the dongle queue is saturated from rapid mode and only
+            # catches ~1 fan per cycle).
+            cpu_changed = cpu_pwm is not None and cpu_pwm != last_sent_cpu
+            gpu_changed = gpu_pwm is not None and gpu_pwm != last_sent_gpu
+            if cpu_changed or gpu_changed:
+                remaining_burst = BURST_CYCLES_ON_CHANGE
+
+            delivery_burst = remaining_burst > 0
+            if delivery_burst:
+                remaining_burst -= 1
+
+            # Inner packet count must match total discovered devices (incl. master)
+            packet_count = len(fans_snap)
+            for fan in real_fans:
+                mac = fan.mac.lower()
+                if mac in gpu_mac_set and gpu_pwm is not None:
+                    fan.pwm = gpu_pwm
+                    fan.target_pwm = gpu_pwm
+                elif cpu_pwm is not None:
+                    fan.pwm = cpu_pwm
+                    fan.target_pwm = cpu_pwm
+                else:
+                    continue
+                for i in range(packet_count):
+                    try:
+                        tx.write(USB_OUT, build_data(fan, i))
+                    except Exception:
+                        pass
+                if delivery_burst:
+                    # Per-fan gap only on real change, so dongle has time to
+                    # process each fan's transaction before the next is sent.
+                    time.sleep(0.15)
+
+            # Record what we actually sent, for hysteresis next iteration
+            if cpu_pwm is not None:
+                last_sent_cpu = cpu_pwm
+            if gpu_pwm is not None:
+                last_sent_gpu = gpu_pwm
+
+            update_state(cpu_temp, gpu_temp, fans_snap)
+        except Exception as e:
+            if DEV_MODE:
+                print(f"[tx] error: {e}")
+        time.sleep(TX_INTERVAL)
+
+
+def fan_control_loop(rx: usb.core.Device, tx: usb.core.Device):
+    global _known_fans
+    initial = list_fans(rx, [])
+    with _state_lock:
+        _known_fans = initial
+
+    threading.Thread(target=discovery_thread, args=(rx,), daemon=True, name="discovery").start()
+    threading.Thread(target=temp_thread, daemon=True, name="temp").start()
+    threading.Thread(target=transmit_thread, args=(tx,), daemon=True, name="tx").start()
+
+    while True:
+        time.sleep(60)
 
 
 # ==============================

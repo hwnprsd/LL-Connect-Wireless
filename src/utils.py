@@ -293,6 +293,13 @@ def load_settings() -> Settings:
                 except ValidationError:
                     changed = True
 
+            cpu_temp_command_raw = raw.get("cpu_temp_command")
+            if cpu_temp_command_raw is not None:
+                if isinstance(cpu_temp_command_raw, str):
+                    settings.cpu_temp_command = cpu_temp_command_raw
+                else:
+                    changed = True
+
         except Exception:
             changed = True
     else:
