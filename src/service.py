@@ -98,6 +98,7 @@ _target_pwm_cpu: Optional[int] = None
 _target_pwm_gpu: Optional[int] = None
 _last_cpu_temp: Optional[float] = None
 _last_gpu_temp: Optional[float] = None
+_resync_requested: bool = False  # set by discovery_thread when it sees a fan whose actual PWM has drifted from target; cleared by transmit_thread after firing a burst
 
 
 # ==============================
@@ -406,24 +407,52 @@ def _compute_targets(cpu_temp: Optional[float], gpu_temp: Optional[float],
 
 
 def discovery_thread(rx: usb.core.Device):
-    global _known_fans
+    global _known_fans, _resync_requested
+    # When a fan's actual PWM (read back from the dongle) drifts from our
+    # commanded target by more than this many bytes, request a resync burst
+    # so the rebroadcast reaches any fans that missed earlier transmits.
+    # Set LLCW_DIVERGE_THRESHOLD=999 to disable monitoring.
+    DIVERGENCE_THRESHOLD = int(os.environ.get("LLCW_DIVERGE_THRESHOLD", "8"))
     iteration = 0
     while True:
         try:
             with _state_lock:
                 snap = list(_known_fans)
+                cpu_target = _target_pwm_cpu
+                gpu_target = _target_pwm_gpu
+                gpu_macs = set(SETTINGS.gpu_temp_macs)
             new_fans = list_fans(rx, snap)
             iteration += 1
             if iteration % 5 == 0:
                 print(f"[discovery] iter={iteration} got {len(new_fans)} fan(s)", flush=True)
             if new_fans:
+                # Divergence check: new_fans[i].pwm here is the actual PWM the
+                # fan firmware reports, straight from the dongle (record[36:40]
+                # in list_fans). Compare to commanded target.
+                diverged_macs = []
+                for f in new_fans:
+                    if not f.is_bound or f.rx_type == 255:
+                        continue
+                    target = gpu_target if f.mac.lower() in gpu_macs else cpu_target
+                    if target is None:
+                        continue
+                    if abs(f.pwm - target) > DIVERGENCE_THRESHOLD:
+                        diverged_macs.append((f.mac, f.pwm, target))
+
                 with _state_lock:
                     prev_targets = {f.mac: f.target_pwm for f in _known_fans}
                     for f in new_fans:
                         if f.mac in prev_targets and prev_targets[f.mac]:
                             f.target_pwm = prev_targets[f.mac]
-                            f.pwm = prev_targets[f.mac]
+                            # Note: do NOT clobber f.pwm here — preserve the
+                            # actual reading for visibility and future checks.
                     _known_fans = new_fans
+                    if diverged_macs:
+                        _resync_requested = True
+
+                if diverged_macs:
+                    for mac, actual, target in diverged_macs:
+                        print(f"[discovery] DIVERGE mac={mac} actual={actual} target={target} -> requesting resync", flush=True)
         except Exception as e:
             print(f"[discovery] ERROR iter={iteration}: {type(e).__name__}: {e}", flush=True)
         time.sleep(DISCOVERY_INTERVAL)
@@ -452,18 +481,62 @@ def temp_thread():
         time.sleep(TEMP_INTERVAL)
 
 
+def reclaim_tx_device(old_tx: usb.core.Device) -> usb.core.Device:
+    """Release the TX USB handle and re-acquire it.
+
+    This is the programmatic equivalent of a `systemctl restart` for just the
+    USB layer — the dongle sees the bulk endpoint go away, drains its queue,
+    and starts fresh. After reclaim, the next transmit lands cleanly instead
+    of being coalesced into a saturated rapid-mode queue. Required because
+    fans that have tripped hardware safe-mode (full speed) only exit when a
+    fresh PWM packet actually arrives at their RF — and an in-flight burst
+    fired into a flooded queue often doesn't make it out as a discrete frame.
+    """
+    try:
+        usb.util.release_interface(old_tx, 0)
+    except Exception as e:
+        print(f"[tx] release_interface error (continuing): {e}", flush=True)
+    try:
+        usb.util.dispose_resources(old_tx)
+    except Exception as e:
+        print(f"[tx] dispose_resources error (continuing): {e}", flush=True)
+    # Brief pause so the dongle's queue actually drains and the USB stack
+    # settles before we re-acquire. Too short = no benefit; too long = fans
+    # may trip safe-mode while we're disconnected.
+    time.sleep(0.4)
+    new_tx = open_device(0x8040)
+    return new_tx
+
+
 def transmit_thread(tx: usb.core.Device):
     # Rapid back-to-back transmits to all fans every cycle, no per-fan gap.
     # When a real value change is detected, switch to a multi-cycle "delivery
     # burst" with per-fan gap so all 4 fans actually receive the new value
     # (single-burst isn't enough to overcome dongle queue saturation).
-    HYSTERESIS = 5
+    # Default 0 = no hysteresis (every PWM delta triggers a delivery burst).
+    # To revert to the old jitter-suppressing behaviour, set the env var
+    # LLCW_HYSTERESIS=5 (or any byte count) in the systemd unit — no rebuild.
+    global _resync_requested
+    HYSTERESIS = int(os.environ.get("LLCW_HYSTERESIS", "0"))
     BURST_CYCLES_ON_CHANGE = 4   # # of 150ms-gap cycles after a change
+    # Periodic forced re-broadcast: every N seconds, fire a delivery burst even
+    # if nothing changed and no divergence was detected. This recovers from
+    # fan-level RF delivery loss that the dongle-side divergence detector is
+    # blind to (the dongle thinks it sent the packet; the fan never got it).
+    # 0 disables periodic re-broadcasting (then only divergence-detected
+    # resyncs fire). Higher = quieter but slower convergence after RF drops.
+    PERIODIC_RESYNC_SEC = int(os.environ.get("LLCW_PERIODIC_RESYNC_SEC", "30"))
     last_sent_cpu = None
     last_sent_gpu = None
     remaining_burst = 0
+    last_periodic_resync = time.monotonic()
     while True:
         try:
+            now = time.monotonic()
+            periodic_due = (
+                PERIODIC_RESYNC_SEC > 0
+                and (now - last_periodic_resync) >= PERIODIC_RESYNC_SEC
+            )
             with _state_lock:
                 fans_snap = list(_known_fans)
                 cpu_pwm = _target_pwm_cpu
@@ -471,6 +544,9 @@ def transmit_thread(tx: usb.core.Device):
                 cpu_temp = _last_cpu_temp
                 gpu_temp = _last_gpu_temp
                 gpu_mac_set = set(SETTINGS.gpu_temp_macs)
+                resync_now = _resync_requested
+                if resync_now:
+                    _resync_requested = False
 
             # Apply hysteresis: small deltas snap back to the last-sent value
             if cpu_pwm is not None and last_sent_cpu is not None:
@@ -493,7 +569,31 @@ def transmit_thread(tx: usb.core.Device):
             # catches ~1 fan per cycle).
             cpu_changed = cpu_pwm is not None and cpu_pwm != last_sent_cpu
             gpu_changed = gpu_pwm is not None and gpu_pwm != last_sent_gpu
-            if cpu_changed or gpu_changed:
+
+            # Periodic forced re-broadcast: do a real TX device reclaim, not
+            # just a burst-into-saturated-queue. A pure burst from the running
+            # daemon gets coalesced with rapid-mode packets and often doesn't
+            # land cleanly enough to pull a fan out of hardware safe-mode.
+            # Reclaim mimics `systemctl restart` for the USB layer.
+            if periodic_due:
+                print(f"[transmit] periodic resync -> reclaiming TX device (every {PERIODIC_RESYNC_SEC}s)", flush=True)
+                try:
+                    tx = reclaim_tx_device(tx)
+                except Exception as e:
+                    print(f"[transmit] reclaim FAILED: {type(e).__name__}: {e}", flush=True)
+                last_periodic_resync = now
+                # After reclaim, force a burst on the next iteration by
+                # invalidating last_sent — the change-detection path will
+                # naturally fire a paced delivery burst.
+                last_sent_cpu = None
+                last_sent_gpu = None
+                # Skip remainder of this cycle so the burst happens fresh
+                time.sleep(TX_INTERVAL)
+                continue
+
+            if cpu_changed or gpu_changed or resync_now:
+                if resync_now and not (cpu_changed or gpu_changed):
+                    print(f"[transmit] resync requested -> firing delivery burst", flush=True)
                 remaining_burst = BURST_CYCLES_ON_CHANGE
 
             delivery_burst = remaining_burst > 0
